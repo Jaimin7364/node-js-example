@@ -1,10 +1,13 @@
 {
-  "name": "gitlab-docker-node",
+  "name": "node-copilot-agent-demo",
   "version": "1.0.0",
+  "description": "Node.js app to demonstrate GitHub Copilot Agent and Render deployment",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "author": "S3CloudHub",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2"
   }
