@@ -1,11 +1,99 @@
 import os
-"""
+import json
+import textwrap
+import requests
+from typing import List, Dict, Any
+
+# --- Config ---------------------------------------------------------------
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+REPO = os.environ.get("GITHUB_REPOSITORY")  # e.g. owner/repo
+PR_NUMBER = int(os.environ.get("PR_NUMBER", "0"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MAX_PATCH_CHARS = int(os.environ.get("MAX_PATCH_CHARS", "100000"))
+
+if not (GITHUB_TOKEN and REPO and PR_NUMBER and GROQ_API_KEY):
+    raise SystemExit("Missing one of: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, GROQ_API_KEY")
+
+owner, repo = REPO.split("/")
+
+# --- GitHub helpers -------------------------------------------------------
+GH = requests.Session()
+GH.headers.update(
+    {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ai-pr-review-poc"
+    }
 )
+
+API = f"https://api.github.com/repos/{owner}/{repo}"
+
+
+def gh_get(url: str, **kwargs) -> Any:
+    r = GH.get(url, timeout=60, **kwargs)
+    r.raise_for_status()
+    return r.json()
+
+
+def gh_post(url: str, payload: Dict[str, Any]) -> Any:
+    r = GH.post(url, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+# --- Collect PR context ---------------------------------------------------
+pr = gh_get(f"{API}/pulls/{PR_NUMBER}")
+files: List[Dict[str, Any]] = gh_get(f"{API}/pulls/{PR_NUMBER}/files?per_page=100")
+
+# Build a unified patch text (truncated for token safety)
+patches = []
+for f in files:
+    patch = f.get("patch") or ""
+    if not patch:
+        continue
+    patches.append(f"--- a/{f['filename']}\n+++ b/{f['filename']}\n{patch}")
+
+unified_diff = "\n\n".join(patches)
+truncated = False
+if len(unified_diff) > MAX_PATCH_CHARS:
+    unified_diff = unified_diff[:MAX_PATCH_CHARS] + "\n... [diff truncated for POC]"
+    truncated = True
+
+# Prepare prompt
+repo_info = textwrap.dedent(f"""
+Repository: {REPO}
+PR #{PR_NUMBER}: {pr.get('title')}
+Author: {pr.get('user', {}).get('login')}
+
+PR description:
+{(pr.get('body') or '(no description)')[:2000]}
+""")
+
+# The model will return JSON so we can render clean markdown
+system_prompt = (
+    "You are a strict senior DevOps and code security reviewer. "
+    "Analyze the provided unified diff and PR context. "
+    "Focus on: security issues, secrets, IaC/CI-Docker pitfalls, correctness, style, and performance. "
+    "Return a concise JSON object with fields: "
+    "summary (string), risk (low|medium|high), recommendations (string), "
+    "findings (array of objects with: file, lines (string or null), severity (info|warning|error), "
+    "rationale, suggestion, and optional snippet). Keep total under 900 words."
+)
+
+user_prompt = textwrap.dedent(f"""
+{repo_info}
+Changed files: {[f['filename'] for f in files]}
+
+Unified diff (context for review):
+{unified_diff}
+""")
 
 # --- Call Groq (Chat Completions with JSON object mode) -------------------
 try:
     from groq import Groq
-except Exception as e:
+except Exception:
     raise SystemExit("groq SDK not installed. Ensure requirements.txt is installed.")
 
 client = Groq(api_key=GROQ_API_KEY)
@@ -17,7 +105,6 @@ completion = client.chat.completions.create(
         {"role": "user", "content": user_prompt},
     ],
     temperature=0,
-    # Ask Groq to emit a valid JSON object
     response_format={"type": "json_object"},
     max_completion_tokens=1200,
 )
